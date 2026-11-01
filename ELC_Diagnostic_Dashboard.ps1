@@ -19,30 +19,35 @@ $Settings = [PSCustomObject]@{
 # ============================
 
 function Get-SwiperData {
-    param([int[]]$SwiperIds)
+    param()
 
-    if (-not $SwiperIds -or $SwiperIds.Count -eq 0) { return @() }
-
-    $ids = $SwiperIds -join ","
     $query = @"
-SELECT Swiper_Id, Game_Id, LastComms, Status
+SELECT Swiper_Id, Polling_Group, LastComms
 FROM Swiper_Units
-WHERE Swiper_Id IN ($ids)
+WHERE Polling_Group IN ('A', 'B', 'C', 'D')
 "@
 
     $connection = New-Object System.Data.SqlClient.SqlConnection
     $connection.ConnectionString = "Server=$($Settings.SqlServer);Database=$($Settings.Database);Integrated Security=True"
-    $connection.Open()
 
-    $command = $connection.CreateCommand()
-    $command.CommandText = $query
+    try {
+        $connection.Open()
 
-    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $command
-    $table = New-Object System.Data.DataTable
-    $adapter.Fill($table) | Out-Null
+        $command = $connection.CreateCommand()
+        $command.CommandText = $query
 
-    $connection.Close()
-    return $table
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $command
+        $table = New-Object System.Data.DataTable
+        $adapter.Fill($table) | Out-Null
+
+        return $table
+    }
+    finally {
+        if ($connection.State -ne [System.Data.ConnectionState]::Closed) {
+            $connection.Close()
+        }
+        $connection.Dispose()
+    }
 }
 
 # ============================
@@ -72,7 +77,7 @@ function Test-Port {
 function Get-HeartbeatStatus {
     param($LastComms)
 
-    if (-not $LastComms) { return "Dead" }
+    if ($null -eq $LastComms -or $LastComms -is [DBNull]) { return "Dead" }
 
     $age = (Get-Date) - $LastComms
 
@@ -86,23 +91,43 @@ function Get-HeartbeatStatus {
 # ============================
 
 function Get-ELCStatus {
-    param($ELC)
+    param($ELC, $SegmentData)
 
     $segmentResults = @()
 
     foreach ($port in $ELC.Ports) {
         $portOpen = Test-Port -IP $ELC.IP -Port $port
 
-        # Dynamic: pull all swipers for this location (simplified: use all)
-        # In a real version you’d filter by Location_Id or Game_Id pattern.
-        $sqlData = Get-SwiperData -SwiperIds @(29,82,93,113,116,117)  # your known swipers
-
-        $lastComms = $sqlData.LastComms | Sort-Object -Descending | Select-Object -First 1
-        $heartbeat = Get-HeartbeatStatus -LastComms $lastComms
-
         $segmentResults += [PSCustomObject]@{
             PortOpen  = $portOpen
-            Heartbeat = $heartbeat
+        }
+    }
+
+    $segmentHealth = foreach ($segmentName in @("A", "B", "C", "D")) {
+        $readers = @()
+        if ($SegmentData.ContainsKey($segmentName)) {
+            $readers = @($SegmentData[$segmentName])
+        }
+        $readerHealth = @($readers | ForEach-Object {
+            [PSCustomObject]@{
+                SwiperId  = $_.SwiperId
+                Heartbeat = Get-HeartbeatStatus -LastComms $_.LastComms
+            }
+        })
+
+        $heartbeat =
+            if ($readerHealth.Count -eq 0 -or $readerHealth.Heartbeat -contains "Dead") { "Dead" }
+            elseif ($readerHealth.Heartbeat -contains "Stale") { "Stale" }
+            else { "Fresh" }
+
+        $readerSummary =
+            if ($readerHealth.Count -eq 0) { "No readers" }
+            else { ($readerHealth | ForEach-Object { "$($_.SwiperId) $($_.Heartbeat)" }) -join ", " }
+
+        [PSCustomObject]@{
+            Name          = $segmentName
+            Heartbeat     = $heartbeat
+            ReaderSummary = $readerSummary
         }
     }
 
@@ -110,20 +135,19 @@ function Get-ELCStatus {
         if ($segmentResults.PortOpen -contains $true) { "Online" } else { "Offline" }
 
     $overallHeartbeat =
-        if ($segmentResults.Heartbeat -contains "Fresh") { "Fresh" }
-        elseif ($segmentResults.Heartbeat -contains "Stale") { "Stale" }
-        else { "Dead" }
+        if ($segmentHealth.Heartbeat -contains "Dead") { "Dead" }
+        elseif ($segmentHealth.Heartbeat -contains "Stale") { "Stale" }
+        else { "Fresh" }
 
-    $segmentsOK =
-        if ($segmentResults.Heartbeat -contains "Dead") { "Issues Detected" }
-        else { "OK" }
+    $segmentsSummary =
+        ($segmentHealth | ForEach-Object { "$($_.Name): $($_.ReaderSummary)" }) -join "; "
 
     return [PSCustomObject]@{
         Name      = $ELC.Name
         IP        = $ELC.IP
         Status    = $overallStatus
         Heartbeat = $overallHeartbeat
-        Segments  = $segmentsOK
+        Segments  = $segmentsSummary
     }
 }
 
@@ -202,13 +226,26 @@ $ELC2PortsBox.Text = ($Settings.ELCs[1].Ports -join ",")
 
 function Render-ELCs {
     $ELCPanel.Children.Clear()
+    $sqlData = Get-SwiperData
+    $segmentData = @{}
+    foreach ($row in $sqlData.Rows) {
+        $group = [string]$row.Polling_Group
+        if (-not $segmentData.ContainsKey($group)) {
+            $segmentData[$group] = @()
+        }
+        $segmentData[$group] += [PSCustomObject]@{
+            SwiperId  = $row.Swiper_Id
+            LastComms = $row.LastComms
+        }
+    }
 
     foreach ($elc in $Settings.ELCs) {
-        $status = Get-ELCStatus -ELC $elc
+        $status = Get-ELCStatus -ELC $elc -SegmentData $segmentData
 
 $block = New-Object System.Windows.Controls.TextBlock
 $block.Margin = "0,0,0,20"
 $block.FontSize = 20
+$block.TextWrapping = "Wrap"
 
 # Determine colors
 $statusColor = if ($status.Status -eq "Online") { "LightGreen" } else { "Red" }
@@ -217,7 +254,7 @@ $heartbeatColor = switch ($status.Heartbeat) {
     "Stale" { "Yellow" }
     default { "Red" }
 }
-$segmentsColor = if ($status.Segments -eq "OK") { "LightGreen" } else { "Red" }
+$segmentsColor = if ($status.Segments -match "Dead") { "Red" } elseif ($status.Segments -match "Stale") { "Yellow" } else { "LightGreen" }
 
 # Build inline formatted text
 $block.Inlines.Add("$( $status.Name ) ($($status.IP))`n")
